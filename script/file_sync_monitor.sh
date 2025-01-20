@@ -1,142 +1,86 @@
 #!/bin/bash
 
 ###################
-# 全局配置
+# Global Configuration
 ###################
 
-# 配置和日志文件路径
-CONFIG_FILE="sync_config.ini"     # 配置文件：包含服务器信息和文件列表
-SYNC_LOG="sync_history.log"       # 同步历史日志：记录成功同步的文件
-ERROR_LOG="sync_error.log"        # 错误日志：记录同步失败的情况
-SFTP_BATCH="/tmp/sftp_batch.txt"  # SFTP批处理命令文件
+# Configuration and log file paths
+CONFIG_FILE="sync_config.ini"     # Config file: contains server info and file list
+SYNC_LOG="sync_history.log"       # Sync history log: records successfully synced files
+ERROR_LOG="sync_error.log"        # Error log: records sync failures
+SFTP_BATCH="/tmp/sftp_batch.txt"  # SFTP batch command file
 
-# 文件写入检测参数
-MAX_WAIT_TIME=300                 # 等待文件写入完成的最大时间（秒）
-CHECK_INTERVAL=2                  # 检查文件状态的时间间隔（秒）
-STABLE_COUNT_REQUIRED=3           # 文件大小保持不变的次数，用于确认写入完成
+# File write detection parameters
+MAX_WAIT_TIME=120                 # Maximum wait time for file write completion (seconds)
+CHECK_INTERVAL=0.1                  # Interval for checking file status (seconds)
+STABLE_COUNT_REQUIRED=3           # Required count of stable size checks to confirm write completion
 
-# 文件检查方法
-CHECK_METHOD="size_check"  # 默认使用文件大小检查
+# SSH key path
+SSH_KEY="/path/to/ssh/key"       # Default SSH key path
 
 ###################
-# 工具函数
+# Utility Functions
 ###################
 
-# 获取文件的MD5值，用于判断文件是否发生变化
+# Get file MD5 value to determine if file has changed
 get_file_md5() {
     local file=$1
     md5sum "$file" | cut -d' ' -f1
 }
 
-# 记录错误信息到日志文件
+# Log error message to error log file
 log_error() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local local_dir=$(dirname "$2")
     local filename=$1
-    local filepath=$2
+    local md5=$5        # New parameter for MD5
+    local user=$6
+    local host=$7
     local remote_path=$3
     local error_msg=$4
     
-    echo "$timestamp|$filename|$filepath|$remote_path|$error_msg" >> "$ERROR_LOG"
-    echo "错误已记录到: $ERROR_LOG"
+    # Format: timestamp|local_dir|filename|md5|user@host:remote_path|error_msg
+    echo "$timestamp|$local_dir|$filename|$md5|$user@$host:$remote_path|$error_msg" >> "$ERROR_LOG"
+    echo "Error logged to: $ERROR_LOG"
 }
 
-# 记录成功同步的信息到历史日志
+# Log successful sync to history log
 log_sync_history() {
     local filepath=$1
     local md5=$2
     local remote_path=$3
+    local user=$4
+    local host=$5
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local local_dir=$(dirname "$filepath")
+    local filename=$(basename "$filepath")
     
-    echo "$timestamp|$filepath|$md5|$remote_path" >> "$SYNC_LOG"
+    # Format: timestamp|local_dir|filename|md5|user@host:remote_path
+    echo "$timestamp|$local_dir|$filename|$md5|$user@$host:$remote_path" >> "$SYNC_LOG"
 }
 
 ###################
-# 文件检查函数
+# File Check Functions
 ###################
 
-# 检查lsof命令是否可用
-check_lsof_available() {
-    command -v lsof >/dev/null 2>&1
-}
-
-# 使用lsof检查文件是否被写入
-is_file_being_written_lsof() {
-    local filepath=$1
-    
-    # 检查文件是否被以写入模式打开
-    if lsof "$filepath" 2>/dev/null | grep -q "w"; then
-        return 0  # 文件正在被写入
-    fi
-    return 1  # 文件未被写入
-}
-
-# 使用文件大小检查文件是否被写入
-is_file_being_written_size() {
+# Check if file is being written
+is_file_being_written() {
     local filepath=$1
     local size1=$(stat -c %s "$filepath" 2>/dev/null)
     sleep $CHECK_INTERVAL
     local size2=$(stat -c %s "$filepath" 2>/dev/null)
     
-    [ "$size1" != "$size2" ]  # 如果大小不同，返回true（0）
+    [ "$size1" != "$size2" ]  # Returns true (0) if size is different
 }
 
-# 统一的文件写入检查接口
-is_file_being_written() {
-    local filepath=$1
-    
-    case "$CHECK_METHOD" in
-        "lsof_check")
-            if check_lsof_available; then
-                is_file_being_written_lsof "$filepath"
-                return $?
-            else
-                echo "警告: lsof 不可用，切换到文件大小检查方法"
-                CHECK_METHOD="size_check"
-                is_file_being_written_size "$filepath"
-                return $?
-            fi
-            ;;
-        "size_check"|*)
-            is_file_being_written_size "$filepath"
-            return $?
-            ;;
-    esac
-}
-
-# 使用lsof等待文件写入完成
-wait_for_file_completion_lsof() {
-    local filepath=$1
-    local wait_time=0
-    
-    echo "检测到文件正在写入，等待完成: $filepath"
-    
-    while [ $wait_time -lt $MAX_WAIT_TIME ]; do
-        if ! is_file_being_written_lsof "$filepath"; then
-            # 额外等待一小段时间确保写入完全结束
-            sleep 3
-            if ! is_file_being_written_lsof "$filepath"; then
-                echo "文件写入已完成: $filepath"
-                return 0
-            fi
-        fi
-        
-        wait_time=$((wait_time + CHECK_INTERVAL))
-        echo "等待文件写入完成... ($wait_time/${MAX_WAIT_TIME}秒)"
-        sleep $CHECK_INTERVAL
-    done
-    
-    echo "错误: 等待文件写入超时 - $filepath"
-    return 1
-}
-
-# 使用文件大小变化等待文件写入完成
-wait_for_file_completion_size() {
+# Wait for file write completion
+wait_for_file_completion() {
     local filepath=$1
     local wait_time=0
     local stable_count=0
     local last_size=$(stat -c %s "$filepath" 2>/dev/null)
     
-    echo "检测到文件正在写入，等待完成: $filepath"
+    echo "File is being written, waiting for completion: $filepath"
     
     while [ $wait_time -lt $MAX_WAIT_TIME ]; do
         sleep $CHECK_INTERVAL
@@ -145,7 +89,7 @@ wait_for_file_completion_size() {
         if [ "$last_size" = "$current_size" ]; then
             stable_count=$((stable_count + 1))
             if [ $stable_count -ge $STABLE_COUNT_REQUIRED ]; then
-                echo "文件写入已完成: $filepath"
+                echo "File write completed: $filepath"
                 return 0
             fi
         else
@@ -154,105 +98,55 @@ wait_for_file_completion_size() {
         fi
         
         wait_time=$((wait_time + CHECK_INTERVAL))
-        echo "等待文件写入完成... ($wait_time/${MAX_WAIT_TIME}秒)"
+        echo "Waiting for file write completion... ($wait_time/${MAX_WAIT_TIME}s)"
     done
     
-    echo "错误: 等待文件写入超时 - $filepath"
+    echo "Error: File write timeout - $filepath"
     return 1
 }
 
-# 统一的文件写入完成等待接口
-wait_for_file_completion() {
-    local filepath=$1
-    
-    case "$CHECK_METHOD" in
-        "lsof_check")
-            if check_lsof_available; then
-                wait_for_file_completion_lsof "$filepath"
-                return $?
-            else
-                echo "警告: lsof 不可用，切换到文件大小检查方法"
-                CHECK_METHOD="size_check"
-                wait_for_file_completion_size "$filepath"
-                return $?
-            fi
-            ;;
-        "size_check"|*)
-            wait_for_file_completion_size "$filepath"
-            return $?
-            ;;
-    esac
-}
-
-# 检查文件是否已经同步过
-# 通过比对MD5值判断文件是否发生变化
+# Check if file has already been synced
 check_if_synced() {
     local filepath=$1
     local md5=$2
+    local user=$3
+    local host=$4
+    local remote_path=$5
+    local filename=$(basename "$filepath")
+    local local_dir=$(dirname "$filepath")
     
-    [ -f "$SYNC_LOG" ] && grep -q "^[^|]*|$filepath|$md5|" "$SYNC_LOG"
+    # Check both MD5 and complete remote path (user@host:remote_path)
+    [ -f "$SYNC_LOG" ] && grep -q "^[^|]*|$local_dir|$filename|$md5|$user@$host:$remote_path$" "$SYNC_LOG"
 }
 
-# 检查远程文件是否存在
+# Find files matching pattern in directory
+find_matching_files() {
+    local pattern=$1
+    local dir=$2
+    find "$dir" -maxdepth 1 -type f -name "$pattern" 2>/dev/null
+}
+
+###################
+# File Sync Functions
+###################
+
+# Check if remote file exists
 check_remote_file() {
     local remote_path=$1
-    ssh -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_HOST" "[ -f '$remote_path' ]"
+    local user=$2
+    local host=$3
+    ssh -i "$SSH_KEY" "$user@$host" "[ -f '$remote_path' ]"
 }
 
-###################
-# 文件同步函数
-###################
-
-# 准备同步文件列表
-prepare_sync_list() {
-    local -n _sync_list=$1  # 通过引用传递数组
-    local filename=$2
-    local filepath=$3
-    local remote_path=$4
-    local overwrite=$5
-    
-    # 1. 检查本地文件是否存在
-    if [ ! -f "$filepath" ]; then
-        log_error "$filename" "$filepath" "$remote_path" "本地文件不存在"
-        return 1
-    fi
-    
-    # 2. 等待文件写入完成（如果正在写入）
-    if is_file_being_written "$filepath"; then
-        if ! wait_for_file_completion "$filepath"; then
-            log_error "$filename" "$filepath" "$remote_path" "等待文件写入完成超时"
-            return 1
-        fi
-    fi
-    
-    # 3. 检查文件是否需要同步
-    local md5=$(get_file_md5 "$filepath")
-    if check_if_synced "$filepath" "$md5"; then
-        echo "跳过: 文件未变化 - $filename"
-        return 0
-    fi
-    
-    # 4. 检查是否可以覆盖远程文件
-    if check_remote_file "$remote_path"; then
-        if [ "$overwrite" != "Y" ]; then
-            log_error "$filename" "$filepath" "$remote_path" "远程文件已存在且未设置覆盖"
-            return 1
-        fi
-        echo "远程文件存在，将被覆盖 - $remote_path"
-    fi
-    
-    # 5. 添加到同步列表
-    _sync_list+=("$filename" "$filepath" "$remote_path" "$md5")
-    return 0
-}
-
-# 创建远程目录
+# Create remote directories
 create_remote_dirs() {
     local -n _sync_list=$1
+    local user=$2
+    local host=$3
     local dirs_created=()
     local remote_dir
     
-    # 收集所有需要创建的远程目录
+    # Collect all required remote directories
     for ((i=0; i<${#_sync_list[@]}; i+=4)); do
         remote_dir=$(dirname "${_sync_list[i+2]}")
         if [[ ! " ${dirs_created[@]} " =~ " ${remote_dir} " ]]; then
@@ -260,143 +154,179 @@ create_remote_dirs() {
         fi
     done
     
-    # 批量创建远程目录
+    # Batch create remote directories
     if [ ${#dirs_created[@]} -gt 0 ]; then
         local cmd="mkdir -p"
         for dir in "${dirs_created[@]}"; do
             cmd+=" '$dir'"
         done
-        if ! ssh -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_HOST" "$cmd"; then
-            echo "错误: 无法创建远程目录"
+        if ! ssh -i "$SSH_KEY" "$user@$host" "$cmd"; then
+            echo "Error: Failed to create remote directories"
             return 1
         fi
     fi
     return 0
 }
 
-# 执行批量同步
-do_batch_sync() {
-    local -n _sync_list=$1
+# Prepare sync list for a specific host
+prepare_host_sync_list() {
+    local -n _sync_list=$1       # Pass array by reference
+    local user=$2
+    local host=$3
+    local remote_base=$4
+    local file_pattern=$5
+    local local_dir=$6
     
-    # 如果没有文件需要同步，直接返回
-    if [ ${#_sync_list[@]} -eq 0 ]; then
-        echo "没有文件需要同步"
-        return 0
-    fi
-    
-    # 创建远程目录
-    if ! create_remote_dirs _sync_list; then
-        return 1
-    fi
-    
-    # 创建SFTP批处理命令文件
-    > "$SFTP_BATCH"
-    for ((i=0; i<${#_sync_list[@]}; i+=4)); do
-        local filepath="${_sync_list[i+1]}"
-        local remote_path="${_sync_list[i+2]}"
-        echo "put \"$filepath\" \"$remote_path\"" >> "$SFTP_BATCH"
-    done
-    
-    # 执行SFTP批量传输
-    echo "开始批量传输文件..."
-    if sftp -b "$SFTP_BATCH" -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_HOST"; then
-        # 记录成功传输的文件
-        for ((i=0; i<${#_sync_list[@]}; i+=4)); do
-            local filename="${_sync_list[i]}"
-            local filepath="${_sync_list[i+1]}"
-            local remote_path="${_sync_list[i+2]}"
-            local md5="${_sync_list[i+3]}"
-            log_sync_history "$filepath" "$md5" "$remote_path"
-            echo "成功: 文件已同步 - $filename"
-        done
-        return 0
-    else
-        echo "错误: 批量传输失败"
-        return 1
-    fi
-}
-
-###################
-# 主程序
-###################
-
-main() {
-    # 1. 检查配置文件是否存在
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "错误: 配置文件 $CONFIG_FILE 不存在"
-        exit 1
-    fi
-    
-    # 2. 读取远程服务器配置
-    eval "$(grep "^REMOTE_" "$CONFIG_FILE")"
-    
-    # 3. 检查必要的配置是否完整
-    if [ -z "$REMOTE_HOST" ] || [ -z "$REMOTE_USER" ] || [ -z "$SSH_KEY" ]; then
-        echo "错误: 缺少远程服务器配置"
-        exit 1
-    fi
-    
-    echo "开始文件同步..."
-    echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "-----------------------------------"
-    
-    # 读取检查方法配置
-    if grep -q "^CHECK_METHOD=" "$CONFIG_FILE"; then
-        CHECK_METHOD=$(grep "^CHECK_METHOD=" "$CONFIG_FILE" | cut -d'=' -f2)
-    fi
-    
-    # 验证检查方法
-    case "$CHECK_METHOD" in
-        "lsof_check")
-            if ! check_lsof_available; then
-                echo "警告: lsof 不可用，切换到文件大小检查方法"
-                CHECK_METHOD="size_check"
-            fi
-            ;;
-        "size_check")
-            ;;
-        *)
-            echo "警告: 未知的检查方法 '$CHECK_METHOD'，使用默认的文件大小检查方法"
-            CHECK_METHOD="size_check"
-            ;;
-    esac
-    
-    echo "使用文件检查方法: $CHECK_METHOD"
-    
-    # 4. 收集需要同步的文件
-    declare -a sync_list=()
-    
-    while IFS='|' read -r filename filepath remote_path overwrite || [ -n "$filename" ]; do
-        # 跳过注释和空行
-        [[ $filename =~ ^#.*$ || -z "$filename" ]] && continue
+    # Find all matching files
+    while IFS= read -r filepath; do
+        local filename=$(basename "$filepath")
+        local remote_path="${remote_base}/${filename}"
         
-        # 去除空格
-        filename=${filename// /}
-        filepath=${filepath// /}
-        remote_path=${remote_path// /}
-        overwrite=${overwrite// /}
-        
-        # 验证覆盖标志
-        if [ "$overwrite" != "Y" ] && [ "$overwrite" != "N" ]; then
-            log_error "$filename" "$filepath" "$remote_path" "无效的覆盖标志: $overwrite"
+        # Check if file is ready for sync
+        if [ ! -f "$filepath" ]; then
+            log_error "$filename" "$filepath" "$remote_path" "Local file does not exist" "" "$user" "$host"
             continue
         fi
         
-        # 准备同步文件
-        prepare_sync_list sync_list "$filename" "$filepath" "$remote_path" "$overwrite"
-    done < <(grep -v "^REMOTE_" "$CONFIG_FILE" | grep "|")
+        if is_file_being_written "$filepath"; then
+            if ! wait_for_file_completion "$filepath"; then
+                log_error "$filename" "$filepath" "$remote_path" "File write timeout" "" "$user" "$host"
+                continue
+            fi
+        fi
+        
+        local md5=$(get_file_md5 "$filepath")
+        # Pass remote_path to check_if_synced
+        if check_if_synced "$filepath" "$md5" "$user" "$host" "$remote_path"; then
+            echo "Skip: File unchanged and already synced to $user@$host:$remote_path - $filename"
+            continue
+        fi
+        
+        # Add to sync list
+        _sync_list+=("$filename" "$filepath" "$remote_path" "$md5")
+        
+    done < <(find_matching_files "$file_pattern" "$local_dir")
+}
+
+# Sync files for a specific host
+sync_host_files() {
+    local user=$1
+    local host=$2
+    local -n _config_list=$3    # List of configurations for this host
     
-    # 5. 执行批量同步
-    do_batch_sync sync_list
+    echo "Processing Host: $host (User: $user)"
+    declare -a sync_list=()
+    
+    # Prepare sync list for all configurations of this host
+    for ((i=0; i<${#_config_list[@]}; i+=3)); do
+        local remote_dir="${_config_list[i]}"
+        local file_pattern="${_config_list[i+1]}"
+        local local_dir="${_config_list[i+2]}"
+        
+        prepare_host_sync_list sync_list "$user" "$host" "$remote_dir" "$file_pattern" "$local_dir"
+    done
+    
+    # If there are files to sync, perform the sync
+    if [ ${#sync_list[@]} -gt 0 ]; then
+        echo "Found ${#sync_list[@]} files to sync for $host"
+        
+        # Create remote directories
+        if ! create_remote_dirs sync_list "$user" "$host"; then
+            log_error "N/A" "N/A" "N/A" "Failed to create remote directories" "N/A" "$user" "$host"
+            return 1
+        fi
+        
+        # Create SFTP batch command file
+        > "$SFTP_BATCH"
+        for ((i=0; i<${#sync_list[@]}; i+=4)); do
+            local filepath="${sync_list[i+1]}"
+            local remote_path="${sync_list[i+2]}"
+            echo "put \"$filepath\" \"$remote_path\"" >> "$SFTP_BATCH"
+        done
+        
+        # Execute SFTP batch transfer
+        echo "Starting batch file transfer to $host..."
+        if sftp -b "$SFTP_BATCH" -i "$SSH_KEY" "$user@$host"; then
+            # Record successfully transferred files
+            for ((i=0; i<${#sync_list[@]}; i+=4)); do
+                local filename="${sync_list[i]}"
+                local filepath="${sync_list[i+1]}"
+                local remote_path="${sync_list[i+2]}"
+                local md5="${sync_list[i+3]}"
+                log_sync_history "$filepath" "$md5" "$remote_path" "$user" "$host"
+                echo "Success: File synced - $filename"
+            done
+        else
+            log_error "N/A" "N/A" "N/A" "Batch transfer failed" "N/A" "$user" "$host"
+            return 1
+        fi
+    else
+        echo "No files to sync for $host"
+    fi
+}
+
+###################
+# Main Program
+###################
+
+main() {
+    # Check if config file exists
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "Error: Config file $CONFIG_FILE does not exist"
+        exit 1
+    fi
+    
+    echo "Starting file sync..."
+    echo "Time: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "-----------------------------------"
+    
+    # Group configurations by user and host
+    declare -A host_configs
+    while IFS='|' read -r user host remote_dir pattern local_dir || [ -n "$user" ]; do
+        # Skip comments and empty lines
+        [[ $user =~ ^#.*$ || -z "$user" ]] && continue
+        
+        # Remove spaces and newlines
+        user=$(echo "$user" | tr -d '[:space:]')
+        host=$(echo "$host" | tr -d '[:space:]')
+        remote_dir=$(echo "$remote_dir" | tr -d '[:space:]')
+        pattern=$(echo "$pattern" | tr -d '[:space:]')
+        local_dir=$(echo "$local_dir" | tr -d '[:space:]')
+        
+        # Create unique key for this user and host combination
+        local key="${user}:${host}"
+        
+        # Add configuration to array
+        if [ -z "${host_configs[$key]}" ]; then
+            host_configs[$key]="${remote_dir}|${pattern}|${local_dir}"
+        else
+            host_configs[$key]+=" ${remote_dir}|${pattern}|${local_dir}"
+        fi
+        
+    done < "$CONFIG_FILE"
+    
+    # Process each user and host combination
+    for key in "${!host_configs[@]}"; do
+        IFS=':' read -r user host <<< "$key"
+        
+        # Convert configuration string to array
+        declare -a config_list
+        while IFS='|' read -r remote_dir pattern local_dir; do
+            config_list+=("$remote_dir" "$pattern" "$local_dir")
+        done < <(echo "${host_configs[$key]}" | tr ' ' '\n')
+        
+        # Sync files for this host
+        sync_host_files "$user" "$host" config_list
+    done
     
     echo "-----------------------------------"
-    echo "同步完成"
-    echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "Sync completed"
+    echo "Time: $(date '+%Y-%m-%d %H:%M:%S')"
     
-    # 清理临时文件
+    # Clean up temporary files
     rm -f "$SFTP_BATCH"
 }
 
-# 执行主程序
+# Execute main program
 trap 'rm -f "$SFTP_BATCH"' EXIT
 main 
