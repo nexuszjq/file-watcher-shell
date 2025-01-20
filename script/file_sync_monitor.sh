@@ -177,7 +177,11 @@ prepare_host_sync_list() {
     local file_pattern=$5
     local local_dir=$6
     
-    # Find all matching files
+    # Create temporary file for file list
+    local temp_file="/tmp/sync_files_$$"
+    find "$local_dir" -maxdepth 1 -type f -name "$file_pattern" 2>/dev/null > "$temp_file"
+    
+    # Process each file
     while IFS= read -r filepath; do
         local filename=$(basename "$filepath")
         local remote_path="${remote_base}/${filename}"
@@ -205,7 +209,8 @@ prepare_host_sync_list() {
         # Add to sync list
         _sync_list+=("$filename" "$filepath" "$remote_path" "$md5")
         
-    done < <(find_matching_files "$file_pattern" "$local_dir")
+    done < "$temp_file"
+    rm -f "$temp_file"
 }
 
 # Sync files for a specific host
@@ -311,9 +316,14 @@ main() {
         
         # Convert configuration string to array
         declare -a config_list
+        # Create temporary file for config
+        local temp_config="/tmp/sync_config_$$"
+        echo "${host_configs[$key]}" | tr ' ' '\n' > "$temp_config"
+        
         while IFS='|' read -r remote_dir pattern local_dir; do
             config_list+=("$remote_dir" "$pattern" "$local_dir")
-        done < <(echo "${host_configs[$key]}" | tr ' ' '\n')
+        done < "$temp_config"
+        rm -f "$temp_config"
         
         # Sync files for this host
         sync_host_files "$user" "$host" config_list
@@ -324,9 +334,9 @@ main() {
     echo "Time: $(date '+%Y-%m-%d %H:%M:%S')"
     
     # Clean up temporary files
-    rm -f "$SFTP_BATCH"
+    rm -f "$SFTP_BATCH" /tmp/sync_*_$$
 }
 
 # Execute main program
-trap 'rm -f "$SFTP_BATCH"' EXIT
+trap 'rm -f "$SFTP_BATCH" /tmp/sync_*_$$' EXIT
 main 
