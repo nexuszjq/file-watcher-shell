@@ -18,14 +18,34 @@ STABLE_COUNT_REQUIRED=3           # Required count of stable size checks to conf
 # SSH key path
 SSH_KEY="/path/to/ssh/key"       # Default SSH key path
 
+# Add to Global Configuration section
+MAX_LOG_DAYS=7                    # Keep logs for last 7 days
+MAX_ARCHIVE_DAYS=30              # Keep archive files for last 30 days
+CHECK_METHOD="stat"    # Available values: "stat" or "md5"
+LOG_DIR="logs"          # Directory for log files
+
 ###################
 # Utility Functions
 ###################
 
-# Get file MD5 value to determine if file has changed
-get_file_md5() {
+# Get file signature based on configured method
+get_file_signature() {
     local file=$1
-    md5sum "$file" | cut -d' ' -f1
+    
+    case "$CHECK_METHOD" in
+        "stat")
+            # Get all information at once and format as size-inode-mtime
+            stat -c "%s-%i-%Y.%N" "$file"
+            ;;
+        "md5")
+            # Use MD5 checksum
+            md5sum "$file" | cut -d' ' -f1
+            ;;
+        *)
+            echo "Error: Invalid check method: $CHECK_METHOD" >&2
+            return 1
+            ;;
+    esac
 }
 
 # Log error message to error log file
@@ -33,21 +53,27 @@ log_error() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local local_dir=$(dirname "$2")
     local filename=$1
-    local md5=$5        # New parameter for MD5
+    local signature=$5
     local user=$6
     local host=$7
     local remote_path=$3
     local error_msg=$4
     
-    # Format: timestamp|local_dir|filename|md5|user@host:remote_path|error_msg
-    echo "$timestamp|$local_dir|$filename|$md5|$user@$host:$remote_path|$error_msg" >> "$ERROR_LOG"
-    echo "Error logged to: $ERROR_LOG"
+    # Create log directory if not exists
+    mkdir -p "$LOG_DIR"
+    
+    # Generate error log filename for this user@host
+    local error_log="${LOG_DIR}/${user}_${host}_error.log"
+    
+    # Format: timestamp|local_dir|filename|signature|remote_path|error_msg
+    echo "$timestamp|$local_dir|$filename|$signature|$remote_path|$error_msg" >> "$error_log"
+    echo "Error logged to: $error_log"
 }
 
 # Log successful sync to history log
 log_sync_history() {
     local filepath=$1
-    local md5=$2
+    local signature=$2
     local remote_path=$3
     local user=$4
     local host=$5
@@ -55,8 +81,14 @@ log_sync_history() {
     local local_dir=$(dirname "$filepath")
     local filename=$(basename "$filepath")
     
-    # Format: timestamp|local_dir|filename|md5|user@host:remote_path
-    echo "$timestamp|$local_dir|$filename|$md5|$user@$host:$remote_path" >> "$SYNC_LOG"
+    # Create log directory if not exists
+    mkdir -p "$LOG_DIR"
+    
+    # Generate log filename for this user@host
+    local log_file="${LOG_DIR}/${user}_${host}_sync_history.log"
+    
+    # Format: timestamp|local_dir|filename|signature|remote_path
+    echo "$timestamp|$local_dir|$filename|$signature|$remote_path" >> "$log_file"
 }
 
 ###################
@@ -108,15 +140,18 @@ wait_for_file_completion() {
 # Check if file has already been synced
 check_if_synced() {
     local filepath=$1
-    local md5=$2
+    local signature=$2
     local user=$3
     local host=$4
     local remote_path=$5
     local filename=$(basename "$filepath")
     local local_dir=$(dirname "$filepath")
     
-    # Check both MD5 and complete remote path (user@host:remote_path)
-    [ -f "$SYNC_LOG" ] && grep -q "^[^|]*|$local_dir|$filename|$md5|$user@$host:$remote_path$" "$SYNC_LOG"
+    # Use specific log file for this user@host
+    local log_file="${LOG_DIR}/${user}_${host}_sync_history.log"
+    
+    # Check signature and remote path
+    [ -f "$log_file" ] && grep -q "^[^|]*|$local_dir|$filename|$signature|$remote_path$" "$log_file"
 }
 
 # Find files matching pattern in directory
@@ -170,18 +205,13 @@ create_remote_dirs() {
 
 # Prepare sync list for a specific host
 prepare_host_sync_list() {
-    local -n _sync_list=$1       # Pass array by reference
+    local -n _sync_list=$1
     local user=$2
     local host=$3
     local remote_base=$4
     local file_pattern=$5
     local local_dir=$6
     
-    # Create temporary file for file list
-    local temp_file="/tmp/sync_files_$$"
-    find "$local_dir" -maxdepth 1 -type f -name "$file_pattern" 2>/dev/null > "$temp_file"
-    
-    # Process each file
     while IFS= read -r filepath; do
         local filename=$(basename "$filepath")
         local remote_path="${remote_base}/${filename}"
@@ -199,18 +229,21 @@ prepare_host_sync_list() {
             fi
         fi
         
-        local md5=$(get_file_md5 "$filepath")
-        # Pass remote_path to check_if_synced
-        if check_if_synced "$filepath" "$md5" "$user" "$host" "$remote_path"; then
+        local signature=$(get_file_signature "$filepath")
+        if [ $? -ne 0 ]; then
+            log_error "$filename" "$filepath" "$remote_path" "Failed to get file signature" "" "$user" "$host"
+            continue
+        fi
+        
+        if check_if_synced "$filepath" "$signature" "$user" "$host" "$remote_path"; then
             echo "Skip: File unchanged and already synced to $user@$host:$remote_path - $filename"
             continue
         fi
         
         # Add to sync list
-        _sync_list+=("$filename" "$filepath" "$remote_path" "$md5")
+        _sync_list+=("$filename" "$filepath" "$remote_path" "$signature")
         
-    done < "$temp_file"
-    rm -f "$temp_file"
+    done < <(find "$local_dir" -maxdepth 1 -type f -name "$file_pattern" 2>/dev/null)
 }
 
 # Sync files for a specific host
@@ -257,8 +290,8 @@ sync_host_files() {
                 local filename="${sync_list[i]}"
                 local filepath="${sync_list[i+1]}"
                 local remote_path="${sync_list[i+2]}"
-                local md5="${sync_list[i+3]}"
-                log_sync_history "$filepath" "$md5" "$remote_path" "$user" "$host"
+                local signature="${sync_list[i+3]}"
+                log_sync_history "$filepath" "$signature" "$remote_path" "$user" "$host"
                 echo "Success: File synced - $filename"
             done
         else
@@ -268,6 +301,52 @@ sync_host_files() {
     else
         echo "No files to sync for $host"
     fi
+}
+
+# Add new function to check and rotate log file
+rotate_log_file() {
+    local log_pattern=$1
+    
+    # Find all matching log files
+    find "$LOG_DIR" -name "$log_pattern" -type f | while read log_file; do
+        # Skip empty files
+        [ ! -s "$log_file" ] && continue
+        
+        # Get file creation time (using ctime)
+        local create_time=$(stat -c "%W" "$log_file")
+        local current_time=$(date +%s)
+        local days_diff=$(( (current_time - create_time) / 86400 ))
+        
+        # If older than MAX_LOG_DAYS, archive the log file
+        if [ $days_diff -ge $MAX_LOG_DAYS ]; then
+            # Use file creation date for archive name
+            local archive_date=$(date -d "@$create_time" '+%Y%m%d')
+            local archive_name="${log_file}.${archive_date}.gz"
+            
+            # Compress current log file
+            gzip -c "$log_file" > "$archive_name"
+            if [ $? -eq 0 ]; then
+                echo "Log file archived to: $archive_name"
+                > "$log_file"
+            else
+                echo "Error: Failed to archive log file: $log_file" >&2
+            fi
+        fi
+    done
+    
+    # Clean up old archive files
+    find "$LOG_DIR" -name "${log_pattern}.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].gz" -type f | while read archive_file; do
+        # Get archive file creation time
+        local archive_time=$(stat -c "%W" "$archive_file")
+        local current_time=$(date +%s)
+        local archive_days_diff=$(( (current_time - archive_time) / 86400 ))
+        
+        # Delete archives older than MAX_ARCHIVE_DAYS
+        if [ $archive_days_diff -ge $MAX_ARCHIVE_DAYS ]; then
+            echo "Removing old archive: $archive_file"
+            rm -f "$archive_file"
+        fi
+    done
 }
 
 ###################
@@ -280,6 +359,13 @@ main() {
         echo "Error: Config file $CONFIG_FILE does not exist"
         exit 1
     fi
+    
+    # Create log directory if not exists
+    mkdir -p "$LOG_DIR"
+    
+    # Check and rotate all log files
+    rotate_log_file "*_sync_history.log"
+    rotate_log_file "*_error.log"
     
     echo "Starting file sync..."
     echo "Time: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -316,14 +402,9 @@ main() {
         
         # Convert configuration string to array
         declare -a config_list
-        # Create temporary file for config
-        local temp_config="/tmp/sync_config_$$"
-        echo "${host_configs[$key]}" | tr ' ' '\n' > "$temp_config"
-        
         while IFS='|' read -r remote_dir pattern local_dir; do
             config_list+=("$remote_dir" "$pattern" "$local_dir")
-        done < "$temp_config"
-        rm -f "$temp_config"
+        done < <(echo "${host_configs[$key]}" | tr ' ' '\n')
         
         # Sync files for this host
         sync_host_files "$user" "$host" config_list
